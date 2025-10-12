@@ -1,5 +1,5 @@
 from __future__ import annotations
-import csv, os, re, sys, glob, subprocess, shutil, concurrent.futures, multiprocessing, unicodedata
+import csv, os, re, sys, glob, subprocess, shutil, concurrent.futures, multiprocessing, unicodedata, time
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Tuple, Dict
 from concurrent.futures import CancelledError
@@ -7,7 +7,7 @@ try:
     from concurrent.futures.process import BrokenProcessPool
 except ImportError:
     BrokenProcessPool = RuntimeError
-    
+
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QFileDialog, QLineEdit, QHBoxLayout,
@@ -97,41 +97,59 @@ def parse_spotify_csv(path: str) -> List[Track]:
     return tracks
 
 
-def _run_ffmpeg_silent(cmd: list[str]) -> bool:
+def _popen_silent(cmd: list[str]) -> subprocess.Popen:
     startupinfo = None
     creationflags = 0
     if os.name == "nt":
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         creationflags = subprocess.CREATE_NO_WINDOW
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        startupinfo=startupinfo, creationflags=creationflags
+    )
+
+
+def hard_convert_to_mp3_proc(in_path: str, out_path: str, kill_event) -> bool:
+    """ffmpeg з можливістю жорсткої зупинки через kill_event."""
+    ffmpeg = FFMPEG_EXE or shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if not ffmpeg:
+        return False
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-i", in_path, "-vn",
+        "-codec:a", "libmp3lame", "-q:a", "4", "-ar", "44100", "-ac", "2",
+        out_path
+    ]
     try:
-        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        stdin=subprocess.DEVNULL, startupinfo=startupinfo,
-                        creationflags=creationflags, check=False)
-        return r.returncode == 0
+        p = _popen_silent(cmd)
+        while True:
+            if kill_event.is_set():
+                try: p.terminate()
+                except Exception: pass
+                try: p.kill()
+                except Exception: pass
+                return False
+            rc = p.poll()
+            if rc is not None:
+                break
+            time.sleep(0.05)
+        ok = (p.returncode == 0)
+        return ok and os.path.exists(out_path) and os.path.getsize(out_path) > 0
     except Exception:
         return False
 
 
-def hard_convert_to_mp3(in_path: str, out_path: str) -> bool:
-    ffmpeg = FFMPEG_EXE or shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
-    if not ffmpeg:
-        return False
-    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", in_path,
-        "-vn", "-codec:a", "libmp3lame", "-q:a", "4", "-ar", "44100", "-ac", "2", out_path]
-    ok = _run_ffmpeg_silent(cmd)
-    return ok and os.path.exists(out_path) and os.path.getsize(out_path) > 0
-
-
-def process_one(index: int, t: Dict, out_dir: str, embed_metadata: bool) -> Tuple[int, bool, str, str]:
+def process_one(index: int, t: Dict, out_dir: str, embed_metadata: bool, kill_event) -> Tuple[int, bool, str, str]:
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     os.environ.setdefault("YTDLP_ENCODING", "utf-8")
 
     if yt_dlp is None or not FFMPEG_EXE:
         return index, False, "yt-dlp or ffmpeg are not available", ""
 
-    title = t.get("title", "").strip()
-    artist = t.get("artist", "").strip()
+    title = (t.get("title") or "").strip()
+    artist = (t.get("artist") or "").strip()
     duration_ms = t.get("duration_ms", None)
     basename = sanitize_filename(f"{artist} - {title}")
 
@@ -142,14 +160,35 @@ def process_one(index: int, t: Dict, out_dir: str, embed_metadata: bool) -> Tupl
         def build_opts():
             outtmpl = os.path.join(out_dir, f"{basename}.%(ext)s")
             return {
-                "outtmpl": outtmpl, "noprogress": True, "quiet": True, "ignoreerrors": True,
-                "noplaylist": True, "format": "bestaudio/best", "postprocessors": [],
-                "prefer_ffmpeg": True, "ffmpeg_location": FFMPEG_DIR, "retries": 5,
-                "fragment_retries": 5, "continuedl": True, "concurrent_fragment_downloads": 8,
-                "socket_timeout": 30, "http_chunk_size": 1_048_576, "throttledratelimit": 0,
+                "outtmpl": outtmpl,
+                "noprogress": True,
+                "quiet": True,
+                "ignoreerrors": True,
+                "noplaylist": True,
+                "format": "bestaudio/best",
+                "postprocessors": [],
+                "prefer_ffmpeg": True,
+                "ffmpeg_location": FFMPEG_DIR,
+                "retries": 5,
+                "fragment_retries": 5,
+                "continuedl": True,
+                "concurrent_fragment_downloads": 1,
+                "socket_timeout": 30,
+                "http_chunk_size": 1_048_576,
+                "throttledratelimit": 0,
             }
 
-        with yt_dlp.YoutubeDL(build_opts()) as ydl:
+        def hook(d):
+            if kill_event.is_set():
+                raise yt_dlp.utils.DownloadError("killed by user")
+
+        opts = build_opts()
+        opts["progress_hooks"] = [hook]
+
+        if kill_event.is_set():
+            return index, False, "Canceled", ""
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=False)
             entries = info.get("entries") or []
             if not entries:
@@ -166,11 +205,18 @@ def process_one(index: int, t: Dict, out_dir: str, embed_metadata: bool) -> Tupl
                         best, best_diff = e, diff
                 chosen = best or chosen
 
+            if kill_event.is_set():
+                return index, False, "Canceled", ""
+
             url = chosen.get("webpage_url") or chosen.get("url")
             if not url:
                 return index, False, "Unknown link", ""
-            with yt_dlp.YoutubeDL(build_opts()) as ydl2:
+
+            with yt_dlp.YoutubeDL(opts) as ydl2:
                 ydl2.download([url])
+
+        if kill_event.is_set():
+            return index, False, "Canceled", ""
 
         pattern = os.path.join(out_dir, glob.escape(basename) + ".*")
         candidates = [p for p in glob.glob(pattern) if not p.lower().endswith(".mp3")]
@@ -179,25 +225,43 @@ def process_one(index: int, t: Dict, out_dir: str, embed_metadata: bool) -> Tupl
         src_file = candidates[0]
         mp3_path = os.path.join(out_dir, f"{basename}.mp3")
 
-        if not hard_convert_to_mp3(src_file, mp3_path):
-            return index, False, "FFmpeg conversion to MP3 failed", ""
+        ok = hard_convert_to_mp3_proc(src_file, mp3_path, kill_event)
+        if not ok:
+            try: os.remove(mp3_path)
+            except Exception: pass
+            return index, False, "FFmpeg conversion to MP3 failed/canceled", ""
+
         try:
             os.remove(src_file)
         except Exception:
             pass
 
+        if kill_event.is_set():
+            try: os.remove(mp3_path)
+            except Exception: pass
+            return index, False, "Canceled", ""
+
         return index, True, "Done", mp3_path
 
+    except yt_dlp.utils.DownloadError as e:
+        try:
+            part_glob = os.path.join(out_dir, basename + ".*.part")
+            for p in glob.glob(part_glob):
+                try: os.remove(p)
+                except Exception: pass
+        except Exception:
+            pass
+        if "killed" in str(e).lower():
+            return index, False, "Canceled", ""
+        return index, False, f"Error: {e}", ""
     except Exception as e:
         return index, False, f"Error: {e}", ""
-
-
 
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CSV → MP3 Downloader (safe stop version)")
+        self.setWindowTitle("CSV → MP3 Downloader (hard stop)")
         self.resize(980, 600)
 
         self.csv_path_edit = QLineEdit()
@@ -207,6 +271,7 @@ class MainWindow(QWidget):
         self.btn_browse_out = QPushButton("Select folder")
         self.btn_browse_out.clicked.connect(self.choose_out_dir)
         self.chk_metadata = QCheckBox("Embed metadata and cover")
+        self.chk_metadata.setChecked(False)
         self.btn_load = QPushButton("Download tracks from CSV")
         self.btn_load.clicked.connect(self.load_csv)
         self.btn_start = QPushButton("Start download")
@@ -251,6 +316,9 @@ class MainWindow(QWidget):
         self.done_count = 0
         self.stopping = False
 
+        self.mgr = multiprocessing.Manager()
+        self.kill_event = self.mgr.Event()
+
     def choose_csv(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select CSV", "", "CSV Files (*.csv);;All Files (*)")
         if path:
@@ -290,6 +358,8 @@ class MainWindow(QWidget):
         embed = self.chk_metadata.isChecked()
 
         self.stopping = False
+        self.kill_event.clear()
+
         self.executor = concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS)
         self.futures.clear()
         self.future_to_index.clear()
@@ -297,7 +367,7 @@ class MainWindow(QWidget):
 
         for idx, t in enumerate(self.tracks):
             self.table.setItem(idx, 2, QTableWidgetItem("At work"))
-            fut = self.executor.submit(process_one, idx, asdict(t), out_dir, embed)
+            fut = self.executor.submit(process_one, idx, asdict(t), out_dir, embed, self.kill_event)
             self.futures.append(fut)
             self.future_to_index[fut] = idx
 
@@ -309,6 +379,8 @@ class MainWindow(QWidget):
 
     def stop_download(self):
         self.stopping = True
+        self.kill_event.set()
+
         for fut in list(self.futures):
             fut.cancel()
         if self.executor:
@@ -317,14 +389,17 @@ class MainWindow(QWidget):
             except Exception:
                 pass
             self.executor = None
+
         for row in range(self.table.rowCount()):
             it = self.table.item(row, 2)
             if it and it.text() not in ("Done", "Canceled"):
                 self.table.setItem(row, 2, QTableWidgetItem("Canceled"))
+
         if self.timer:
             self.timer.stop()
             self.timer.deleteLater()
             self.timer = None
+
         self.futures.clear()
         self.future_to_index.clear()
         self.btn_stop.setEnabled(False)
@@ -334,7 +409,6 @@ class MainWindow(QWidget):
     def _poll_futures(self):
         if not self.futures:
             return
-        total_before = len(self.futures)
         for fut in list(self.futures):
             if not fut.done():
                 continue
@@ -380,6 +454,7 @@ class MainWindow(QWidget):
     def closeEvent(self, event):
         try:
             self.stopping = True
+            self.kill_event.set()
             if self.timer:
                 self.timer.stop()
                 self.timer.deleteLater()
@@ -403,7 +478,7 @@ def main():
     w = MainWindow()
     w.show()
     code = app.exec()
-    os._exit(code)
+    os._exit(code) 
 
 
 if __name__ == "__main__":
