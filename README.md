@@ -37,9 +37,7 @@ python main.py
 ## 4) Build to EXE (Windows)
 ```bash
 pip install pyinstaller
-pyinstaller --noconfirm --onefile --windowed --name SpotCSV2MP3 ^
-  --collect-data imageio_ffmpeg ^
-  main.py
+pyinstaller --noconfirm --onefile --windowed --name SpotCSV2MP3 --collect-data imageio_ffmpeg  main.py
 ```
 
 The build works standalone — ffmpeg is auto-provided by `imageio-ffmpeg`.
