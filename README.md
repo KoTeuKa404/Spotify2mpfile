@@ -1,4 +1,4 @@
-# CSV → MP3 Downloader (PyQt + yt-dlp, silent ffmpeg, multiprocess, Unicode-safe)
+# Spotify playlist CSV → MP3 Downloader (PyQt + yt-dlp)
 
 A tiny desktop app that reads a **Spotify playlist CSV** and downloads each track as **MP3**.
 It searches the track on **YouTube** (via `yt-dlp`), downloads best audio, and **silently** converts to `.mp3` using `ffmpeg` from `imageio-ffmpeg` (no PATH needed, no console windows).
