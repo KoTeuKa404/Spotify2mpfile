@@ -38,6 +38,8 @@ python main.py
 ```bash
 pip install pyinstaller
 pyinstaller --noconfirm --onefile --windowed --name SpotCSV2MP3 --collect-data imageio_ffmpeg  main.py
+or
+pyinstaller --noconfirm --onefile --windowed --name SpotCSV2MP3 --collect-all imageio_ffmpeg --collect-all yt_dlp main.py
 ```
 
 The build works standalone — ffmpeg is auto-provided by `imageio-ffmpeg`.
