@@ -181,9 +181,10 @@ def _popen_silent(cmd: list[str]) -> subprocess.Popen:
 
 
 def hard_convert_to_mp3_proc(in_path: str, out_path: str, kill_event, pause_event) -> bool:
-    ffmpeg = FFMPEG_EXE or shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    ffmpeg, _ = resolve_ffmpeg()
     if not ffmpeg:
         return False
+
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-i", in_path, "-vn",
@@ -323,7 +324,30 @@ def _ffmpeg_embed_meta(mp3_path: str, title: str, artist: str, album: str, cover
                 os.remove(cover_file)
             except Exception:
                 pass
+def resolve_ffmpeg() -> tuple[Optional[str], Optional[str]]:
+    try:
+        import imageio_ffmpeg as iio_ffmpeg
+        exe = iio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.isfile(exe):
+            return exe, os.path.dirname(exe)
+    except Exception:
+        pass
 
+    for candidate in [
+        shutil.which("ffmpeg"),
+        shutil.which("ffmpeg.exe"),
+        os.path.join(os.getcwd(), "ffmpeg.exe"),
+        os.path.join(os.path.dirname(sys.executable), "ffmpeg.exe"),
+    ]:
+        if candidate and os.path.isfile(candidate):
+            return candidate, os.path.dirname(candidate)
+
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidate = os.path.join(sys._MEIPASS, "ffmpeg.exe")
+        if os.path.isfile(candidate):
+            return candidate, os.path.dirname(candidate)
+
+    return None, None
 
 def process_one(
     index: int,
@@ -338,8 +362,16 @@ def process_one(
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     os.environ.setdefault("YTDLP_ENCODING", "utf-8")
 
-    if yt_dlp is None or (not FFMPEG_EXE and not keep_original):
-        return index, False, "yt-dlp or ffmpeg are not available", ""
+    ffmpeg_exe, ffmpeg_dir = resolve_ffmpeg()
+
+    if yt_dlp is None:
+        return index, False, "yt-dlp is not available", ""
+
+    if not keep_original and not ffmpeg_exe:
+        return index, False, "ffmpeg is not available", ""
+
+    if ffmpeg_dir:
+        os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
 
     title = (t.get("title") or "").strip()
     artist = (t.get("artist") or "").strip()
@@ -359,11 +391,11 @@ def process_one(
                 "noprogress": True,
                 "quiet": True,
                 "ignoreerrors": True,
-                "noplaylist": True,  # IMPORTANT: we download one video at a time even if url is playlist
+                "noplaylist": True,
                 "format": "bestaudio/best",
                 "postprocessors": [],
                 "prefer_ffmpeg": True,
-                "ffmpeg_location": FFMPEG_DIR,
+                "ffmpeg_location": ffmpeg_dir or ffmpeg_exe,
                 "retries": 5,
                 "fragment_retries": 5,
                 "continuedl": True,
@@ -392,11 +424,14 @@ def process_one(
             url = source_url
             while pause_event.is_set() and not kill_event.is_set():
                 time.sleep(0.1)
+
             with yt_dlp.YoutubeDL(opts) as ydl:
                 chosen_info = ydl.extract_info(url, download=True)
+
             chosen = chosen_info or {}
         else:
             query = f"ytsearch10:{artist} - {title} official"
+
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(query, download=False)
                 entries = (info or {}).get("entries") or []
@@ -406,6 +441,7 @@ def process_one(
 
             if kill_event.is_set():
                 return index, False, "Canceled", ""
+
             while pause_event.is_set() and not kill_event.is_set():
                 time.sleep(0.1)
 
@@ -418,13 +454,20 @@ def process_one(
 
         if kill_event.is_set():
             return index, False, "Canceled", ""
+
         while pause_event.is_set() and not kill_event.is_set():
             time.sleep(0.1)
 
         pattern = os.path.join(out_dir, glob.escape(basename) + ".*")
-        candidates = [p for p in glob.glob(pattern) if not p.lower().endswith(".mp3")]
+        candidates = [
+            p for p in glob.glob(pattern)
+            if not p.lower().endswith(".mp3") and not p.lower().endswith(".part")
+        ]
+
         if not candidates:
             return index, False, "Downloaded file not found", ""
+
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         src_file = candidates[0]
 
         if keep_original:
@@ -432,21 +475,25 @@ def process_one(
 
         mp3_path = os.path.join(out_dir, f"{basename}.mp3")
         ok = hard_convert_to_mp3_proc(src_file, mp3_path, kill_event, pause_event)
+
         if not ok:
             try:
-                os.remove(mp3_path)
+                if os.path.exists(mp3_path):
+                    os.remove(mp3_path)
             except Exception:
                 pass
             return index, False, "FFmpeg conversion to MP3 failed/canceled", ""
 
         try:
-            os.remove(src_file)
+            if os.path.exists(src_file):
+                os.remove(src_file)
         except Exception:
             pass
 
         if kill_event.is_set():
             try:
-                os.remove(mp3_path)
+                if os.path.exists(mp3_path):
+                    os.remove(mp3_path)
             except Exception:
                 pass
             return index, False, "Canceled", ""
@@ -459,6 +506,7 @@ def process_one(
                     thumbs = chosen.get("thumbnails") or []
                     if thumbs:
                         thumb_url = (thumbs[-1] or {}).get("url")
+
             _ffmpeg_embed_meta(mp3_path, title, artist, album, thumb_url)
 
         return index, True, "Done", mp3_path
@@ -473,12 +521,14 @@ def process_one(
                     pass
         except Exception:
             pass
+
         if "killed" in str(e).lower():
             return index, False, "Canceled", ""
-        return index, False, f"Error: {e}", ""
-    except Exception as e:
+
         return index, False, f"Error: {e}", ""
 
+    except Exception as e:
+        return index, False, f"Error: {e}", ""
 
 def _compute_workers(accelerated: bool) -> int:
     cpu = os.cpu_count() or 2
