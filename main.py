@@ -49,6 +49,7 @@ class Track:
     artist: str
     album: Optional[str] = None
     duration_ms: Optional[int] = None
+    source_url: Optional[str] = None  # NEW: direct youtube url for playlist items
 
 
 FORBIDDEN_CHARS = set('\\/:*?"<>|')
@@ -121,6 +122,47 @@ def parse_spotify_csv(path: str) -> List[Track]:
                     dur = None
             if title and artist:
                 tracks.append(Track(title=title, artist=artist, album=album or None, duration_ms=dur))
+    return tracks
+
+
+def parse_youtube_playlist(url: str) -> List[Track]:
+    url = (url or "").strip()
+    if not url:
+        return []
+
+    opts = {
+        "quiet": True,
+        "ignoreerrors": True,
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "noplaylist": False,
+    }
+
+    tracks: List[Track] = []
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        entries = (info or {}).get("entries") or []
+        for e in entries:
+            if not e:
+                continue
+            title = (e.get("title") or "").strip()
+            uploader = (e.get("uploader") or e.get("channel") or e.get("uploader_id") or "Unknown").strip()
+            dur = e.get("duration")
+            src = e.get("webpage_url") or e.get("url")
+            if src and not str(src).startswith("http"):
+                # sometimes flat entries contain only id
+                src = f"https://www.youtube.com/watch?v={src}"
+
+            if title and src:
+                tracks.append(
+                    Track(
+                        title=title,
+                        artist=uploader,
+                        album=(info or {}).get("title") or None,
+                        duration_ms=int(dur * 1000) if isinstance(dur, (int, float)) else None,
+                        source_url=src,
+                    )
+                )
     return tracks
 
 
@@ -209,7 +251,6 @@ def _pick_best(entries: List[dict], title: str, artist: str, target_sec: Optiona
 
 
 def _ffmpeg_embed_meta(mp3_path: str, title: str, artist: str, album: str, cover_url: Optional[str]) -> bool:
-    """Запис ID3v2.3 тегів та, за можливості, обкладинки."""
     ffmpeg = FFMPEG_EXE or shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
     if not ffmpeg:
         return False
@@ -304,11 +345,12 @@ def process_one(
     artist = (t.get("artist") or "").strip()
     album = (t.get("album") or "").strip()
     duration_ms = t.get("duration_ms", None)
+    source_url = (t.get("source_url") or "").strip() or None
+
     basename = sanitize_filename(f"{artist} - {title}")
 
     try:
         target_sec = (int(duration_ms) // 1000) if duration_ms else None
-        query = f"ytsearch10:{artist} - {title} official"
 
         def build_opts():
             outtmpl = os.path.join(out_dir, f"{basename}.%(ext)s")
@@ -317,7 +359,7 @@ def process_one(
                 "noprogress": True,
                 "quiet": True,
                 "ignoreerrors": True,
-                "noplaylist": True,
+                "noplaylist": True,  # IMPORTANT: we download one video at a time even if url is playlist
                 "format": "bestaudio/best",
                 "postprocessors": [],
                 "prefer_ffmpeg": True,
@@ -343,12 +385,24 @@ def process_one(
         if kill_event.is_set():
             return index, False, "Canceled", ""
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-            entries = info.get("entries") or []
-            if not entries:
-                return index, False, "No results found", ""
-            chosen = _pick_best(entries, title, artist, target_sec) or entries[0]
+        chosen = None
+        chosen_info = None
+
+        if source_url:
+            url = source_url
+            while pause_event.is_set() and not kill_event.is_set():
+                time.sleep(0.1)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                chosen_info = ydl.extract_info(url, download=True)
+            chosen = chosen_info or {}
+        else:
+            query = f"ytsearch10:{artist} - {title} official"
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+                entries = (info or {}).get("entries") or []
+                if not entries:
+                    return index, False, "No results found", ""
+                chosen = _pick_best(entries, title, artist, target_sec) or entries[0]
 
             if kill_event.is_set():
                 return index, False, "Canceled", ""
@@ -398,11 +452,13 @@ def process_one(
             return index, False, "Canceled", ""
 
         if embed_metadata:
-            thumb_url = chosen.get("thumbnail")
-            if not thumb_url:
-                thumbs = chosen.get("thumbnails") or []
-                if thumbs:
-                    thumb_url = (thumbs[-1] or {}).get("url")
+            thumb_url = None
+            if chosen:
+                thumb_url = chosen.get("thumbnail")
+                if not thumb_url:
+                    thumbs = chosen.get("thumbnails") or []
+                    if thumbs:
+                        thumb_url = (thumbs[-1] or {}).get("url")
             _ffmpeg_embed_meta(mp3_path, title, artist, album, thumb_url)
 
         return index, True, "Done", mp3_path
@@ -434,12 +490,18 @@ def _compute_workers(accelerated: bool) -> int:
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CSV → MP3 Downloader (pause/resume, cover embed)")
-        self.resize(1000, 640)
+        self.setWindowTitle("CSV or YouTube Playlist -> MP3 Downloader (pause/resume, cover embed)")
+        self.resize(1000, 680)
 
         self.csv_path_edit = QLineEdit()
         self.btn_browse_csv = QPushButton("Select CSV")
         self.btn_browse_csv.clicked.connect(self.choose_csv)
+
+        self.playlist_edit = QLineEdit()
+        self.playlist_edit.setPlaceholderText("Paste YouTube playlist URL here (optional)")
+        self.btn_load_playlist = QPushButton("Load playlist")
+        self.btn_load_playlist.clicked.connect(self.load_playlist)
+
         self.out_dir_edit = QLineEdit()
         self.btn_browse_out = QPushButton("Select folder")
         self.btn_browse_out.clicked.connect(self.choose_out_dir)
@@ -466,7 +528,7 @@ class MainWindow(QWidget):
         self.chk_spotify_audio = QCheckBox("Download from Spotify (NOT SUPPORTED YET)")
         self.chk_spotify_audio.setEnabled(False)
 
-        self.btn_load = QPushButton("Download tracks from CSV")
+        self.btn_load = QPushButton("Load tracks from CSV")
         self.btn_start = QPushButton("Start")
         self.btn_stop = QPushButton("Pause")
         self.btn_start.setEnabled(False)
@@ -481,14 +543,27 @@ class MainWindow(QWidget):
             self.table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
 
-        top1 = QHBoxLayout(); top1.addWidget(self.csv_path_edit, 1); top1.addWidget(self.btn_browse_csv)
-        top2 = QHBoxLayout(); top2.addWidget(self.out_dir_edit, 1); top2.addWidget(self.btn_browse_out)
+        top1 = QHBoxLayout()
+        top1.addWidget(self.csv_path_edit, 1)
+        top1.addWidget(self.btn_browse_csv)
+        top1.addWidget(self.btn_load)
+
+        playlist_row = QHBoxLayout()
+        playlist_row.addWidget(self.playlist_edit, 1)
+        playlist_row.addWidget(self.btn_load_playlist)
+
+        top2 = QHBoxLayout()
+        top2.addWidget(self.out_dir_edit, 1)
+        top2.addWidget(self.btn_browse_out)
 
         ctrl = QHBoxLayout()
-        ctrl.addWidget(self.btn_load); ctrl.addStretch(1); ctrl.addWidget(self.btn_start); ctrl.addWidget(self.btn_stop)
+        ctrl.addStretch(1)
+        ctrl.addWidget(self.btn_start)
+        ctrl.addWidget(self.btn_stop)
 
         main = QVBoxLayout(self)
         main.addLayout(top1)
+        main.addLayout(playlist_row)
         main.addLayout(top2)
         main.addLayout(options_row)
         main.addWidget(self.chk_spotify_audio)
@@ -521,6 +596,17 @@ class MainWindow(QWidget):
         if path:
             self.out_dir_edit.setText(path)
 
+    def _fill_table(self):
+        self.table.setRowCount(0)
+        for t in self.tracks:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            self.table.setItem(r, 0, QTableWidgetItem(t.title))
+            self.table.setItem(r, 1, QTableWidgetItem(t.artist))
+            self.table.setItem(r, 2, QTableWidgetItem("Waiting"))
+            self.table.setItem(r, 3, QTableWidgetItem(""))
+        self.btn_start.setEnabled(bool(self.tracks))
+
     def load_csv(self):
         path = self.csv_path_edit.text().strip()
         if not path or not os.path.exists(path):
@@ -531,15 +617,22 @@ class MainWindow(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "CSV reading error", str(e))
             return
-        self.table.setRowCount(0)
-        for t in self.tracks:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            self.table.setItem(r, 0, QTableWidgetItem(t.title))
-            self.table.setItem(r, 1, QTableWidgetItem(t.artist))
-            self.table.setItem(r, 2, QTableWidgetItem("Waiting"))
-            self.table.setItem(r, 3, QTableWidgetItem(""))
-        self.btn_start.setEnabled(bool(self.tracks))
+        self._fill_table()
+
+    def load_playlist(self):
+        url = self.playlist_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Error", "Paste a YouTube playlist URL.")
+            return
+        try:
+            self.tracks = parse_youtube_playlist(url)
+        except Exception as e:
+            QMessageBox.critical(self, "Playlist error", str(e))
+            return
+        if not self.tracks:
+            QMessageBox.warning(self, "Playlist", "No entries found (or playlist is private/blocked).")
+            return
+        self._fill_table()
 
     def start_download(self):
         out_dir = self.out_dir_edit.text().strip()
@@ -555,6 +648,10 @@ class MainWindow(QWidget):
 
         if self.chk_spotify_audio.isChecked():
             self.chk_spotify_audio.setChecked(False)
+
+        if not self.tracks:
+            QMessageBox.warning(self, "Error", "Load CSV or playlist first.")
+            return
 
         self.kill_event.clear()
         self.pause_event.clear()
